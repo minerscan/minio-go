@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/encrypt"
@@ -279,7 +280,64 @@ func (c *Client) putObjectCommon(ctx context.Context, bucketName, objectName str
 		return c.putObject(ctx, bucketName, objectName, reader, size, opts)
 	}
 
-	return c.putObjectMultipartStream(ctx, bucketName, objectName, reader, size, opts)
+	return c.putObjectMultipartStreamNoLength(ctx, bucketName, objectName, reader, opts)
+}
+
+type workerPool struct {
+	maxWorker   int
+	queuedTaskC chan *uploadPartParams
+	stopC       chan struct{}
+	errU        error
+	waitg       sync.WaitGroup
+}
+
+func NewWorkerPool(maxWorker int) *workerPool {
+	return &workerPool{
+		maxWorker:   maxWorker,
+		queuedTaskC: make(chan *uploadPartParams, maxWorker),
+		stopC:       make(chan struct{}),
+		errU:        nil,
+		waitg:       sync.WaitGroup{},
+	}
+}
+
+func (wp *workerPool) Run(ctx context.Context, client *Client, maps *sync.Map) {
+	for i := 0; i < wp.maxWorker; i++ {
+		go func() {
+			for {
+				select {
+				case p := <-wp.queuedTaskC:
+					objPart, uerr := client.uploadPart(ctx, *p)
+					wp.waitg.Done()
+					if uerr != nil {
+						wp.errU = uerr
+						return
+					}
+
+					// Save successfully uploaded part metadata.
+					maps.Store(p.partNumber, objPart)
+				case <-wp.stopC:
+					return
+				}
+			}
+		}()
+	}
+}
+func (wp *workerPool) Stop() {
+	wp.stopC <- struct{}{}
+}
+
+func (wp *workerPool) getError() error {
+	return wp.errU
+}
+
+func (wp *workerPool) Wait() {
+	wp.waitg.Wait()
+}
+
+func (wp *workerPool) AddTask(p *uploadPartParams) {
+	wp.waitg.Add(1)
+	wp.queuedTaskC <- p
 }
 
 func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketName, objectName string, reader io.Reader, opts PutObjectOptions) (info UploadInfo, err error) {
@@ -328,7 +386,9 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 	partNumber := 1
 
 	// Initialize parts uploaded map.
-	partsInfo := make(map[int]ObjectPart)
+	var partsMap sync.Map
+	wp := NewWorkerPool(10)
+	wp.Run(ctx, c, &partsMap)
 
 	// Create a buffer.
 	buf := make([]byte, partSize)
@@ -336,10 +396,10 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 	// Create checksums
 	// CRC32C is ~50% faster on AMD64 @ 30GB/s
 	var crcBytes []byte
-	customHeader := make(http.Header)
 	crc := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 
 	for partNumber <= totalPartsCount {
+		customHeader := make(http.Header)
 		length, rerr := readFull(reader, buf)
 		if rerr == io.EOF && partNumber > 1 {
 			break
@@ -366,17 +426,18 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 
 		// Update progress reader appropriately to the latest offset
 		// as we read from the source.
-		rd := newHook(bytes.NewReader(buf[:length]), opts.Progress)
 
-		// Proceed to upload the part.
-		p := uploadPartParams{bucketName: bucketName, objectName: objectName, uploadID: uploadID, reader: rd, partNumber: partNumber, md5Base64: md5Base64, size: int64(length), sse: opts.ServerSideEncryption, streamSha256: !opts.DisableContentSha256, customHeader: customHeader}
-		objPart, uerr := c.uploadPart(ctx, p)
-		if uerr != nil {
-			return UploadInfo{}, uerr
+		data := make([]byte, 0, length)
+		newbuf := bytes.NewBuffer(data)
+		_, err = io.Copy(newbuf, bytes.NewReader(buf[:length]))
+		if err != nil {
+			return UploadInfo{}, err
 		}
+		rd := newHook(bytes.NewReader(newbuf.Bytes()[:length]), opts.Progress)
+		// Proceed to upload the part.
 
-		// Save successfully uploaded part metadata.
-		partsInfo[partNumber] = objPart
+		p := uploadPartParams{bucketName: bucketName, objectName: objectName, uploadID: uploadID, reader: rd, partNumber: partNumber, md5Base64: md5Base64, size: int64(length), sse: opts.ServerSideEncryption, streamSha256: !opts.DisableContentSha256, customHeader: customHeader}
+		wp.AddTask(&p)
 
 		// Save successfully uploaded size.
 		totalUploadedSize += int64(length)
@@ -391,13 +452,20 @@ func (c *Client) putObjectMultipartStreamNoLength(ctx context.Context, bucketNam
 		}
 	}
 
+	wp.Wait()
+	if uerr := wp.getError(); err != nil {
+		return UploadInfo{}, uerr
+	}
+	wp.Stop()
+
 	// Loop over total uploaded parts to save them in
 	// Parts array before completing the multipart request.
 	for i := 1; i < partNumber; i++ {
-		part, ok := partsInfo[i]
+		part1, ok := partsMap.Load(i)
 		if !ok {
 			return UploadInfo{}, errInvalidArgument(fmt.Sprintf("Missing part number %d", i))
 		}
+		part := part1.(ObjectPart)
 		complMultipartUpload.Parts = append(complMultipartUpload.Parts, CompletePart{
 			ETag:           part.ETag,
 			PartNumber:     part.PartNumber,
